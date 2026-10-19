@@ -10,7 +10,7 @@
 - **Network:** GenLayer Studionet (`studionet`)
 - **Chain ID:** `61999` (`0xF1EF`)
 - **RPC URL:** `https://studio.genlayer.com/api`
-- **Contract Address:** `0xC92244190819e09cC06602d4D8e0CA3E5e31baE4`
+- **Contract Address:** `0x5F922FacAc4Fd4d1a36FEcBf4286a9E1F0383F29`
 - **Deployment Transaction Hash:** `0xe6e04072b30af6ccab48497174d0361e35302e15b529db1bcf618dcfaed6aa04`
 - **Receipt Status:** `Status: 5 (FINALIZED)` | `Result: 6 (SUCCESS)`
 
