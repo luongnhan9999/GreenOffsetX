@@ -16,6 +16,7 @@
 - **RPC Endpoint:** `https://studio.genlayer.com/api`
 - **Contract Address:** `0xD9388b6dB536475E0F0df5ca162186B4F0703917`
 - **Deployment Transaction Hash:** `0xf7068fec5cfd2beaad9e5909916883c04fcb18252b60d2dff68b55c429e31cdf`
+- **Live Interaction Tx Hash (`fund_buyer_pool`):** `0xd51a3f1f2df4bd5fe9aba99becc9e4d110dbf164b2c8816e5771f8efe11b453d`
 - **Finality Status:** `Status: 5 (FINALIZED)` | `Result: 6 (SUCCESS)`
 - **Deployer Address:** `0x17A59dD5Ba274C5e11a082a9f81D46704D9d1345`
 
