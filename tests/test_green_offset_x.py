@@ -17,20 +17,39 @@ def test_initial_state(contract, direct_vm):
         expected_sender = "0x" + expected_sender
     assert owner_str == expected_sender
 
-    stats = json.loads(contract.get_stats())
+    stats = json.loads(contract.get_vault_stats())
     assert stats["total_projects"] == 0
     assert stats["verified_count"] == 0
-    assert stats["total_offset_issued"] == "0"
+    assert stats["total_tonnes_verified"] == "0"
+    assert stats["buyer_pool_balance"] == "0"
+    assert stats["buffer_reserve_pool"] == "0"
+    assert stats["price_per_ton"] == 10
 
 
-def test_submit_carbon_project_success(contract, direct_vm, direct_alice):
+def test_fund_buyer_pool(contract, direct_vm, direct_bob):
+    direct_vm.sender = direct_bob
+    direct_vm.value = 20000
+
+    contract.fund_buyer_pool(
+        sponsor_name="Global Climate Fund ESG Pool",
+        price_per_ton=15
+    )
+
+    stats = json.loads(contract.get_vault_stats())
+    assert stats["buyer_pool_balance"] == "20000"
+    assert stats["price_per_ton"] == 15
+
+
+def test_submit_carbon_mrv_success(contract, direct_vm, direct_alice):
     direct_vm.sender = direct_alice
-    direct_vm.value = 5000
+    direct_vm.value = 1000
 
-    pid = contract.submit_carbon_project(
-        project_name="Amazonian Reforestation Canopy Initiative",
-        description="Reforestation project restoring native biodiversity with verifiable multi-spectral satellite imagery and carbon sequestration tracking.",
-        audit_report_url="https://climate-registry.org/reports/amazon-reforestation-2026.json"
+    pid = contract.submit_carbon_mrv(
+        project_name="Sumatra Mangrove Blue Carbon MRV Parcel",
+        ecosystem_type="MANGROVE",
+        ground_sensor_url="https://iot-sensors.eco/sumatra/flux-tower-stream.json",
+        satellite_report_url="https://sentinel-hub.org/reports/sumatra-ndvi-2026.json",
+        claimed_tonnes=500
     )
 
     assert pid == "1"
@@ -39,213 +58,275 @@ def test_submit_carbon_project_success(contract, direct_vm, direct_alice):
     p = json.loads(contract.get_project("1"))
     assert p["project_id"] == "1"
     assert p["proposer"] == direct_alice.as_hex.lower()
-    assert "Amazonian Reforestation" in p["project_name"]
-    assert p["deposit_amount"] == "5000"
+    assert "Sumatra Mangrove" in p["project_name"]
+    assert p["ecosystem_type"] == "MANGROVE"
+    assert p["staked_bond"] == "1000"
+    assert p["claimed_tonnes"] == 500
+    assert p["verified_tonnes"] == 0
     assert p["status"] == "PENDING"
     assert p["verdict"] == "PENDING"
-    assert p["impact_score"] == 0
-
-    stats = json.loads(contract.get_stats())
-    assert stats["total_projects"] == 1
 
 
-def test_submit_carbon_project_validations(contract, direct_vm, direct_alice):
+def test_submit_carbon_mrv_validations(contract, direct_vm, direct_alice):
     direct_vm.sender = direct_alice
     direct_vm.value = 1000
 
     # 1. Short name (< 5 chars)
     with pytest.raises(Exception, match="Project name is too short"):
-        contract.submit_carbon_project(
-            project_name="Eco",
-            description="Valid description with more than twenty characters long.",
-            audit_report_url="https://climate-registry.org/audit/123"
+        contract.submit_carbon_mrv(
+            project_name="Tree",
+            ecosystem_type="MANGROVE",
+            ground_sensor_url="https://sensors.org/telemetry",
+            satellite_report_url="https://satellite.org/ndvi",
+            claimed_tonnes=100
         )
 
-    # 2. Short description (< 20 chars)
-    with pytest.raises(Exception, match="Description is too short"):
-        contract.submit_carbon_project(
-            project_name="Valid Project Name",
-            description="Too short",
-            audit_report_url="https://climate-registry.org/audit/123"
+    # 2. Invalid ecosystem
+    with pytest.raises(Exception, match="Invalid ecosystem type"):
+        contract.submit_carbon_mrv(
+            project_name="Valid Rainforest Initiative",
+            ecosystem_type="INDUSTRIAL_FACTORY",
+            ground_sensor_url="https://sensors.org/telemetry",
+            satellite_report_url="https://satellite.org/ndvi",
+            claimed_tonnes=100
         )
 
-    # 3. Invalid URL scheme
-    with pytest.raises(Exception, match="URL must start with http:// or https://"):
-        contract.submit_carbon_project(
-            project_name="Valid Project Name",
-            description="Valid description with more than twenty characters long.",
-            audit_report_url="ftp://climate-registry.org/audit/123"
+    # 3. Stake bond below 500 GEN
+    direct_vm.value = 400
+    with pytest.raises(Exception, match="Minimum verification stake bond is 500 GEN"):
+        contract.submit_carbon_mrv(
+            project_name="Valid Rainforest Initiative",
+            ecosystem_type="REFORESTATION",
+            ground_sensor_url="https://sensors.org/telemetry",
+            satellite_report_url="https://satellite.org/ndvi",
+            claimed_tonnes=100
         )
 
-    # 4. SSRF / Localhost attempt
+    direct_vm.value = 1000
+    # 4. Zero claimed tonnes
+    with pytest.raises(Exception, match="Claimed tonnes must be greater than zero"):
+        contract.submit_carbon_mrv(
+            project_name="Valid Rainforest Initiative",
+            ecosystem_type="REFORESTATION",
+            ground_sensor_url="https://sensors.org/telemetry",
+            satellite_report_url="https://satellite.org/ndvi",
+            claimed_tonnes=0
+        )
+
+    # 5. SSRF / Localhost blocking
     with pytest.raises(Exception, match="Local and private network URLs are prohibited"):
-        contract.submit_carbon_project(
-            project_name="Valid Project Name",
-            description="Valid description with more than twenty characters long.",
-            audit_report_url="http://127.0.0.1:8000/audit"
+        contract.submit_carbon_mrv(
+            project_name="Valid Rainforest Initiative",
+            ecosystem_type="REFORESTATION",
+            ground_sensor_url="http://127.0.0.1:8080/sensor",
+            satellite_report_url="https://satellite.org/ndvi",
+            claimed_tonnes=100
         )
 
 
-def test_verify_carbon_project_not_found(contract, direct_vm, direct_alice):
+def test_verify_carbon_mrv_not_found(contract, direct_vm, direct_alice):
     direct_vm.sender = direct_alice
     with pytest.raises(Exception, match="Carbon project not found"):
-        contract.verify_carbon_impact("999")
+        contract.verify_carbon_mrv("999")
 
 
-def test_verify_carbon_impact_verified_success(contract, direct_vm, direct_alice):
+def test_verify_carbon_mrv_verified_issuance(contract, direct_vm, direct_alice, direct_bob):
+    # 1. Sponsor funds buyer liquidity pool
+    direct_vm.sender = direct_bob
+    direct_vm.value = 10000
+    contract.fund_buyer_pool("Climate ESG Liquidity Vault", price_per_ton=10)
+
+    # 2. Proposer submits project with 1,000 GEN stake bond
     direct_vm.sender = direct_alice
-    direct_vm.value = 8000
-
-    pid = contract.submit_carbon_project(
-        project_name="Mangrove Blue Carbon Sequestration Basin",
-        description="Restoration of degraded coastal mangrove forests with drone LiDAR biomass measurements and satellite NDVI ground truthing.",
-        audit_report_url="https://bluecarbon.org/audits/mangrove-basin-alpha.json"
+    direct_vm.value = 1000
+    pid = contract.submit_carbon_mrv(
+        project_name="Amazonian Agroforestry Carbon Sink",
+        ecosystem_type="AGROFORESTRY",
+        ground_sensor_url="https://iot-ground.org/amazon/parcelA-flux.json",
+        satellite_report_url="https://copernicus-sentinel.eu/amazon/canopy-ndvi.json",
+        claimed_tonnes=400
     )
 
-    audit_web_content = """
+    ground_data = """
     {
-      "project": "Mangrove Blue Carbon Sequestration Basin",
-      "biomass_growth_rate": "12.4%",
-      "verified_carbon_offset_tco2e": 45000,
-      "ndvi_spectral_index": 0.82,
-      "audit_status": "APPROVED_VERIFIED_ADDITIONALITY"
+      "sensor_station": "AMZ-FLUX-01",
+      "co2_flux_net_uptake": "4.8 gC/m2/day",
+      "biomass_annual_growth_rate": "8.5%",
+      "soil_organic_carbon_gain": "1.2 tC/ha"
+    }
+    """
+
+    sat_data = """
+    {
+      "mission": "Sentinel-2 Multi-Spectral",
+      "mean_ndvi_spectral_index": 0.84,
+      "canopy_cover_percentage": "91.2%",
+      "deforestation_anomaly_detected": false
     }
     """
 
     sim_installMocks({
         "web_mocks": {
-            ".*bluecarbon.org.*": {"status": 200, "body": audit_web_content}
+            ".*iot-ground.org.*": {"status": 200, "body": ground_data},
+            ".*copernicus-sentinel.eu.*": {"status": 200, "body": sat_data}
         },
         "llm_mocks": {
-            "impact_score": 88,
-            "verdict": "VERIFIED_OFFSET",
-            "audit_summary": "Extensive mangrove biomass growth and satellite NDVI verification confirm 45,000 tCO2e additionality."
+            "verified_tonnes": 380,
+            "consistency_score": 94,
+            "verdict": "VERIFIED_ISSUANCE",
+            "audit_summary": "High cross-source agreement (94%). Verified 380 tonnes CO2e drawdown with no anomaly flags."
         }
     }, vm=direct_vm)
 
-    contract.verify_carbon_impact(pid)
+    contract.verify_carbon_mrv(pid)
 
     p = json.loads(contract.get_project(pid))
     assert p["status"] == "VERIFIED"
-    assert p["verdict"] == "VERIFIED_OFFSET"
-    assert p["impact_score"] == 88
-    assert p["payout"] == "8000"
-    assert "mangrove biomass growth" in p["audit_summary"]
+    assert p["verdict"] == "VERIFIED_ISSUANCE"
+    assert p["verified_tonnes"] == 380
+    assert p["consistency_score"] == 94
 
-    stats = json.loads(contract.get_stats())
+    # Valuation: 380 tonnes * 10 GEN = 3,800 GEN
+    # 15% buffer reserve = 570 GEN
+    # 85% net reward = 3,230 GEN
+    assert p["payout_amount"] == "3230"
+    assert p["buffer_allocated"] == "570"
+
+    stats = json.loads(contract.get_vault_stats())
     assert stats["verified_count"] == 1
-    assert stats["total_offset_issued"] == "8000"
+    assert stats["total_tonnes_verified"] == "380"
+    # Remaining buyer pool: 10,000 - 3,800 = 6,200 GEN
+    assert stats["buyer_pool_balance"] == "6200"
+    # Buffer reserve pool: 570 GEN
+    assert stats["buffer_reserve_pool"] == "570"
 
 
-def test_verify_carbon_impact_insufficient_impact_rejected(contract, direct_vm, direct_alice):
+def test_verify_carbon_mrv_fraud_discrepancy_slashed(contract, direct_vm, direct_alice):
+    # Proposer submits fake project with 1,000 GEN bond
     direct_vm.sender = direct_alice
-    direct_vm.value = 4000
-
-    pid = contract.submit_carbon_project(
-        project_name="Suburban Lawn Replacement Initiative",
-        description="Converting residential turf grass into decorative gravel gardens with minimal documented carbon sequestration impact.",
-        audit_report_url="https://climate-registry.org/audits/suburban-lawn.json"
+    direct_vm.value = 1000
+    pid = contract.submit_carbon_mrv(
+        project_name="Highland Pine Reforestation Project",
+        ecosystem_type="REFORESTATION",
+        ground_sensor_url="https://fraudulent-sensor.org/highland-data.json",
+        satellite_report_url="https://landsat.nasa.gov/highland-satellite.json",
+        claimed_tonnes=600
     )
 
-    audit_web_content = """
+    ground_spoofed = """
     {
-      "project": "Suburban Lawn Replacement Initiative",
-      "biomass_growth_rate": "0.1%",
-      "verified_carbon_offset_tco2e": 2,
-      "audit_status": "NEGLIGIBLE_IMPACT"
+      "sensor": "SPOOFED_STREAM",
+      "claimed_biomass_growth": "+65%",
+      "reported_absorption": "600 tCO2e"
+    }
+    """
+
+    sat_real = """
+    {
+      "mission": "Landsat-9 Thermal & Optical",
+      "canopy_loss": "-45%",
+      "wildfire_burn_scar": "CONFIRMED_RECENT_BURN",
+      "mean_ndvi": 0.12
     }
     """
 
     sim_installMocks({
         "web_mocks": {
-            ".*climate-registry.org.*": {"status": 200, "body": audit_web_content}
+            ".*fraudulent-sensor.org.*": {"status": 200, "body": ground_spoofed},
+            ".*landsat.nasa.gov.*": {"status": 200, "body": sat_real}
         },
         "llm_mocks": {
-            "impact_score": 25,
-            "verdict": "INSUFFICIENT_IMPACT",
-            "audit_summary": "Insignificant carbon sequestration detected. Project fails environmental additionality threshold."
+            "verified_tonnes": 0,
+            "consistency_score": 8,
+            "verdict": "FRAUD_DISCREPANCY",
+            "audit_summary": "Critical contradiction: Ground sensor claims +65% growth while satellite confirms extensive wildfire burn scar and tree loss."
         }
     }, vm=direct_vm)
 
-    contract.verify_carbon_impact(pid)
+    contract.verify_carbon_mrv(pid)
 
     p = json.loads(contract.get_project(pid))
-    assert p["status"] == "REJECTED"
-    assert p["verdict"] == "INSUFFICIENT_IMPACT"
-    assert p["impact_score"] == 25
-    assert p["payout"] == "0"
-    assert "Insignificant carbon sequestration" in p["audit_summary"]
+    assert p["status"] == "REJECTED_DISCREPANCY"
+    assert p["verdict"] == "FRAUD_DISCREPANCY"
+    assert p["payout_amount"] == "0"
+    assert p["verified_tonnes"] == 0
 
-    stats = json.loads(contract.get_stats())
-    assert stats["verified_count"] == 0
-    assert stats["total_offset_issued"] == "0"
+    # Proposer's 1,000 GEN staked bond is slashed into buffer reserve pool!
+    stats = json.loads(contract.get_vault_stats())
+    assert stats["buffer_reserve_pool"] == "1000"
 
 
-def test_verify_carbon_impact_failed_evidence_refund(contract, direct_vm, direct_alice):
+def test_verify_carbon_mrv_failed_evidence_refund(contract, direct_vm, direct_alice):
     direct_vm.sender = direct_alice
-    direct_vm.value = 3500
+    direct_vm.value = 800
 
-    pid = contract.submit_carbon_project(
-        project_name="Boreal Peatland Restoration Zone",
-        description="Peatland re-wetting project to prevent methane leakage with water table sensor telemetry.",
-        audit_report_url="https://climate-registry.org/broken-link-404"
+    pid = contract.submit_carbon_mrv(
+        project_name="Boreal Peatland Methane Abatement",
+        ecosystem_type="PEATLAND",
+        ground_sensor_url="https://peatland.org/sensor-stream.json",
+        satellite_report_url="https://satellite.org/dead-link-404.json",
+        claimed_tonnes=300
     )
 
     sim_installMocks({
         "web_mocks": {
-            ".*broken-link-404.*": {"status": 404, "body": "404 Not Found - Sensor stream unavailable"}
+            ".*peatland.org.*": {"status": 200, "body": "Ground water table normal"},
+            ".*dead-link-404.*": {"status": 404, "body": "404 Not Found - Data unavailable"}
         }
     }, vm=direct_vm)
 
-    contract.verify_carbon_impact(pid)
+    contract.verify_carbon_mrv(pid)
 
     p = json.loads(contract.get_project(pid))
     assert p["status"] == "FAILED_EVIDENCE"
-    assert p["verdict"] == "FAILED_EVIDENCE"
-    assert p["impact_score"] == 0
-    assert p["payout"] == "3500"
+    assert p["verdict"] == "INSUFFICIENT_DATA"
+    assert p["payout_amount"] == "0"
     assert "offline or inaccessible" in p["audit_summary"]
 
-    stats = json.loads(contract.get_stats())
-    assert stats["verified_count"] == 0
-    assert stats["total_offset_issued"] == "0"
 
+def test_cannot_reverify_verified_project(contract, direct_vm, direct_alice, direct_bob):
+    direct_vm.sender = direct_bob
+    direct_vm.value = 5000
+    contract.fund_buyer_pool("ESG Pool", price_per_ton=10)
 
-def test_cannot_reverify_verified_project(contract, direct_vm, direct_alice):
     direct_vm.sender = direct_alice
-    direct_vm.value = 2000
-
-    pid = contract.submit_carbon_project(
-        project_name="Highland Reforestation Ridge",
-        description="Planting 50,000 native pine saplings on eroded slopes with verifiable satellite tracking.",
-        audit_report_url="https://forestry.org/audits/highland.json"
+    direct_vm.value = 1000
+    pid = contract.submit_carbon_mrv(
+        project_name="Coastal Kelp Blue Carbon Parcel",
+        ecosystem_type="MANGROVE",
+        ground_sensor_url="https://sensors.eco/kelp.json",
+        satellite_report_url="https://sentinel.org/kelp.json",
+        claimed_tonnes=200
     )
 
     sim_installMocks({
         "web_mocks": {
-            ".*": {"status": 200, "body": "Valid verified satellite report"}
+            ".*": {"status": 200, "body": "Valid verified marine telemetry"}
         },
         "llm_mocks": {
-            "impact_score": 85,
-            "verdict": "VERIFIED_OFFSET",
-            "audit_summary": "Highland reforestation verified successfully."
+            "verified_tonnes": 200,
+            "consistency_score": 90,
+            "verdict": "VERIFIED_ISSUANCE",
+            "audit_summary": "Kelp bed verified."
         }
     }, vm=direct_vm)
 
-    contract.verify_carbon_impact(pid)
+    contract.verify_carbon_mrv(pid)
 
-    with pytest.raises(Exception, match="Carbon project has already been verified"):
-        contract.verify_carbon_impact(pid)
+    with pytest.raises(Exception, match="Project has already undergone MRV verification"):
+        contract.verify_carbon_mrv(pid)
 
 
 def test_cancel_project_by_proposer(contract, direct_vm, direct_alice):
     direct_vm.sender = direct_alice
-    direct_vm.value = 1500
+    direct_vm.value = 600
 
-    pid = contract.submit_carbon_project(
-        project_name="Urban Rooftop Garden Array",
-        description="Installation of green roof vegetated mats across commercial warehouse complex.",
-        audit_report_url="https://urban-eco.org/audits/rooftop1.json"
+    pid = contract.submit_carbon_mrv(
+        project_name="Biochar Carbon Enriched Farmland",
+        ecosystem_type="BIOCHAR",
+        ground_sensor_url="https://agri.org/biochar-stream.json",
+        satellite_report_url="https://satellite.org/soil-index.json",
+        claimed_tonnes=150
     )
 
     contract.cancel_project(pid)
@@ -253,8 +334,7 @@ def test_cancel_project_by_proposer(contract, direct_vm, direct_alice):
     p = json.loads(contract.get_project(pid))
     assert p["status"] == "CANCELLED"
     assert p["verdict"] == "CANCELLED"
-    assert p["payout"] == "1500"
-    assert "Cancelled by proposer" in p["audit_summary"]
+    assert "Withdrawn by proposer" in p["audit_summary"]
 
     with pytest.raises(Exception, match="Only pending projects can be cancelled"):
         contract.cancel_project(pid)
@@ -262,12 +342,14 @@ def test_cancel_project_by_proposer(contract, direct_vm, direct_alice):
 
 def test_cancel_project_unauthorized(contract, direct_vm, direct_alice, direct_bob):
     direct_vm.sender = direct_alice
-    direct_vm.value = 1000
+    direct_vm.value = 700
 
-    pid = contract.submit_carbon_project(
-        project_name="Biochar Soil Enrichment Parcel",
-        description="Distribution of pyrolysis biochar to agricultural soils for permanent carbon sequestration.",
-        audit_report_url="https://biochar-test.org/audits/parcel4.json"
+    pid = contract.submit_carbon_mrv(
+        project_name="Degraded Soil Agroforestry Plot",
+        ecosystem_type="AGROFORESTRY",
+        ground_sensor_url="https://agri.org/sensors.json",
+        satellite_report_url="https://satellite.org/canopy.json",
+        claimed_tonnes=100
     )
 
     # Bob tries to cancel Alice's project

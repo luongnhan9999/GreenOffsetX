@@ -53,36 +53,49 @@ def _validate_url(raw_url: str) -> str:
 
 @allow_storage
 @dataclass
-class CarbonProject:
+class CarbonMRVProject:
     project_id: str
     proposer: Address
     project_name: str
-    description: str
-    audit_report_url: str       # Satellite data or environmental sensor audit URL
-    deposit_amount: bigint
-    status: str                 # "PENDING", "VERIFIED", "REJECTED", "FAILED_EVIDENCE", "CANCELLED"
-    verdict: str                # "VERIFIED_OFFSET", "INSUFFICIENT_IMPACT", "FAILED_EVIDENCE", "CANCELLED"
-    impact_score: bigint        # 0 to 100 impact score
-    audit_summary: str
+    ecosystem_type: str         # "MANGROVE", "REFORESTATION", "PEATLAND", "BIOCHAR"
+    ground_sensor_url: str      # Source 1: In-situ IoT flux / soil carbon telemetry stream
+    satellite_report_url: str   # Source 2: Independent multi-spectral remote sensing (NDVI / canopy)
+    staked_bond: bigint         # Proposer security bond (slashed if fraud/spoofing detected)
+    claimed_tonnes: bigint      # Target claimed metric tonnes of CO2 drawdown
+    verified_tonnes: bigint     # Net verified metric tonnes of CO2 sequestered
+    consistency_score: bigint   # Cross-source agreement score (0-100%)
+    status: str                 # "PENDING", "VERIFIED", "REJECTED_DISCREPANCY", "FAILED_EVIDENCE", "CANCELLED"
+    verdict: str                # "VERIFIED_ISSUANCE", "FRAUD_DISCREPANCY", "INSUFFICIENT_DATA", "CANCELLED"
+    audit_summary: str          # Concise AI consensus findings
+    payout_amount: bigint       # 85% net proceeds disbursed to eco-steward
+    buffer_allocated: bigint    # 15% permanence buffer reserve locked against reversal risks
     created_at: bigint
     resolved_at: bigint
-    payout: bigint
 
 class Contract(gl.Contract):
     """
-    GreenOffsetX: Dynamic Carbon Credit & Environmental Impact Verifier Protocol on GenLayer
+    GreenOffsetX: Autonomous Cross-Source MRV & Dynamic Carbon Credit Issuance Vault.
+    Performs on-chain multi-source cross-correlation between ground IoT telemetry and
+    independent satellite remote sensing, minting verified carbon credits with a 15%
+    permanence buffer reserve and slashing fraudulent claimants.
     """
     owner: Address
     project_count: bigint
-    projects: TreeMap[str, CarbonProject]
+    projects: TreeMap[str, CarbonMRVProject]
     verified_count: bigint
-    total_offset_issued: bigint
+    total_tonnes_verified: bigint
+    buyer_pool_balance: bigint
+    buffer_reserve_pool: bigint
+    price_per_ton: bigint
 
     def __init__(self):
         self.owner = _get_sender()
         self.project_count = bigint(0)
         self.verified_count = bigint(0)
-        self.total_offset_issued = bigint(0)
+        self.total_tonnes_verified = bigint(0)
+        self.buyer_pool_balance = bigint(0)
+        self.buffer_reserve_pool = bigint(0)
+        self.price_per_ton = bigint(10)  # Default 10 GEN per metric tonne CO2
 
     def _get_current_timestamp(self) -> bigint:
         try:
@@ -116,103 +129,160 @@ class Contract(gl.Contract):
         return int(self.project_count)
 
     @gl.public.write.payable
-    def submit_carbon_project(self, project_name: str, description: str, audit_report_url: str) -> str:
+    def fund_buyer_pool(self, sponsor_name: str, price_per_ton: int) -> None:
         """
-        Submit a green/carbon offset project for autonomous environmental verification.
+        Institutional buyers/sponsors deposit liquidity to purchase verified carbon credits.
         """
         deposit = bigint(gl.message.value)
+        if deposit <= bigint(0):
+            raise gl.UserError("Deposit must be greater than zero.")
+        clean_name = sponsor_name.strip()
+        if len(clean_name) < 2:
+            raise gl.UserError("Sponsor name is required.")
+
+        self.buyer_pool_balance += deposit
+        if price_per_ton > 0:
+            self.price_per_ton = bigint(price_per_ton)
+
+    @gl.public.write.payable
+    def submit_carbon_mrv(
+        self,
+        project_name: str,
+        ecosystem_type: str,
+        ground_sensor_url: str,
+        satellite_report_url: str,
+        claimed_tonnes: int
+    ) -> str:
+        """
+        Submit eco-project for cross-source MRV validation with a mandatory security stake bond.
+        """
+        stake = bigint(gl.message.value)
+        if stake < bigint(500):
+            raise gl.UserError("Minimum verification stake bond is 500 GEN.")
+
         clean_name = project_name.strip()
-        clean_desc = description.strip()
-        clean_url = _validate_url(audit_report_url)
+        clean_type = ecosystem_type.strip().upper()
+        clean_ground = _validate_url(ground_sensor_url)
+        clean_sat = _validate_url(satellite_report_url)
 
         if len(clean_name) < 5:
             raise gl.UserError("Project name is too short.")
-        if len(clean_desc) < 20:
-            raise gl.UserError("Description is too short.")
+        valid_ecosystems = ("MANGROVE", "REFORESTATION", "PEATLAND", "BIOCHAR", "AGROFORESTRY")
+        if clean_type not in valid_ecosystems:
+            raise gl.UserError("Invalid ecosystem type.")
+        if claimed_tonnes <= 0:
+            raise gl.UserError("Claimed tonnes must be greater than zero.")
 
         self.project_count += bigint(1)
         pid = str(self.project_count)
         now_ts = self._get_current_timestamp()
 
-        self.projects[pid] = CarbonProject(
+        self.projects[pid] = CarbonMRVProject(
             project_id=pid,
             proposer=_get_sender(),
             project_name=clean_name,
-            description=clean_desc,
-            audit_report_url=clean_url,
-            deposit_amount=deposit,
+            ecosystem_type=clean_type,
+            ground_sensor_url=clean_ground,
+            satellite_report_url=clean_sat,
+            staked_bond=stake,
+            claimed_tonnes=bigint(claimed_tonnes),
+            verified_tonnes=bigint(0),
+            consistency_score=bigint(0),
             status="PENDING",
             verdict="PENDING",
-            impact_score=bigint(0),
-            audit_summary="Awaiting validator carbon offset consensus.",
+            audit_summary="Awaiting decentralized cross-source MRV consensus.",
+            payout_amount=bigint(0),
+            buffer_allocated=bigint(0),
             created_at=now_ts if now_ts > bigint(0) else self.project_count,
-            resolved_at=bigint(0),
-            payout=bigint(0)
+            resolved_at=bigint(0)
         )
         return pid
 
     @gl.public.write
-    def verify_carbon_impact(self, project_id: str) -> None:
+    def verify_carbon_mrv(self, project_id: str) -> None:
         """
-        Validators scrape the environmental audit URL on-chain and use GenLayer LLM jury consensus
-        to evaluate emission reduction and carbon offset validity.
+        Autonomous Multi-Source MRV: Validators fetch both Ground IoT telemetry and Satellite
+        spectral imagery directly on-chain, cross-correlate additionality, and detect sensor fraud.
         """
         if project_id not in self.projects:
             raise gl.UserError("Carbon project not found.")
 
         proj = self.projects[project_id]
         if proj.status != "PENDING":
-            raise gl.UserError("Carbon project has already been verified.")
+            raise gl.UserError("Project has already undergone MRV verification.")
 
         name_local = str(proj.project_name)
-        desc_local = str(proj.description)
-        url_local = str(proj.audit_report_url)
+        eco_local = str(proj.ecosystem_type)
+        ground_url = str(proj.ground_sensor_url)
+        sat_url = str(proj.satellite_report_url)
+        target_tonnes = int(proj.claimed_tonnes)
 
         def leader_fn():
-            web_content = ""
+            # Source 1: Scrape In-situ IoT ground sensor stream
+            ground_raw = ""
             try:
-                res = gl.nondet.web.render(url_local, mode="text")
-                if hasattr(res, "content"):
-                    web_content = res.content
-                elif isinstance(res, dict) and "body" in res:
-                    web_content = res["body"]
-                else:
-                    web_content = str(res)
+                g_res = gl.nondet.web.render(ground_url, mode="text")
+                ground_raw = g_res.content if hasattr(g_res, "content") else (g_res.get("body", "") if isinstance(g_res, dict) else str(g_res))
             except Exception:
-                web_content = ""
+                ground_raw = ""
 
-            lower_web = web_content[:500].lower() if web_content else ""
-            if len(web_content.strip()) < 15 or "404 not found" in lower_web or "error" in lower_web:
+            # Source 2: Scrape Independent Satellite remote sensing observations
+            sat_raw = ""
+            try:
+                s_res = gl.nondet.web.render(sat_url, mode="text")
+                sat_raw = s_res.content if hasattr(s_res, "content") else (s_res.get("body", "") if isinstance(s_res, dict) else str(s_res))
+            except Exception:
+                sat_raw = ""
+
+            # Handle offline / 404 dead links
+            g_lower = ground_raw[:400].lower() if ground_raw else ""
+            s_lower = sat_raw[:400].lower() if sat_raw else ""
+            if len(ground_raw.strip()) < 15 or len(sat_raw.strip()) < 15 or "404 not found" in g_lower or "404 not found" in s_lower:
                 return {
-                    "impact_score": 0,
-                    "verdict": "FAILED_EVIDENCE",
-                    "audit_summary": "Audit report source is offline or inaccessible."
+                    "verified_tonnes": 0,
+                    "consistency_score": 0,
+                    "verdict": "INSUFFICIENT_DATA",
+                    "audit_summary": "One or more telemetry sources offline or inaccessible."
                 }
 
-            snippet = web_content[:4000]
+            ground_snippet = ground_raw[:2500]
+            sat_snippet = sat_raw[:2500]
 
-            prompt = f"""You are an expert Environmental Auditor and Carbon Credit Verifier.
-Evaluate the validity and emission reduction impact of the following carbon offset project based on the scraped audit report.
+            prompt = f"""You are an expert Ecological MRV (Measurement, Reporting, and Verification) Auditor.
+Perform a strict multi-source cross-correlation between in-situ Ground IoT telemetry and independent Satellite Remote Sensing.
 
-PROJECT NAME: {name_local}
-DESCRIPTION: {desc_local}
+PROJECT: {name_local} (Ecosystem: {eco_local})
+CLAIMED CARBON SEQUESTRATION: {target_tonnes} metric tonnes CO2e
 
-SCRAPED AUDIT REPORT EVIDENCE:
+[SOURCE 1: GROUND SENSOR / FLUX TOWER TELEMETRY]
 \"\"\"
-{snippet}
+{ground_snippet}
 \"\"\"
 
-EVALUATION RULES:
-- Assign an impact_score from 0 to 100 based on verified carbon reduction and environmental additionality (0 = insufficient/fraudulent, 100 = exceptional carbon offset).
-- Determine verdict: "VERIFIED_OFFSET" if impact_score >= 70, otherwise "INSUFFICIENT_IMPACT". If evidence is unparsable, return "FAILED_EVIDENCE".
-- Provide a concise professional audit summary (max 250 characters).
+[SOURCE 2: SATELLITE REMOTE SENSING (NDVI / CANOPY BIOMASS)]
+\"\"\"
+{sat_snippet}
+\"\"\"
+
+CROSS-SOURCE EVALUATION RULES:
+1. Cross-Source Consistency Index (0-100): Measure statistical agreement between Ground Telemetry and Satellite Observations.
+2. Sensor Spoofing & Fraud Detection:
+   - If ground sensors claim heavy carbon accumulation but satellite observations show deforestation, clear-cutting, fire scars, or negligible NDVI growth, flag as "FRAUD_DISCREPANCY".
+3. Net Verified Sequestration (verified_tonnes):
+   - Quantify actual verified metric tonnes of CO2 drawdown (integer between 0 and {target_tonnes}).
+4. Final Verdict:
+   - "VERIFIED_ISSUANCE": consistency_score >= 70 AND verified_tonnes > 0 AND no fraud detected.
+   - "FRAUD_DISCREPANCY": irreconcilable contradiction or fabricated sensor telemetry.
+   - "INSUFFICIENT_DATA": data corrupted, vague, or insufficient to prove additionality.
+5. Provide concise audit summary (max 250 characters).
 
 OUTPUT FORMAT:
 Respond ONLY with a VALID JSON object (no markdown, no backticks):
 {{
-  "impact_score": <integer 0-100>,
-  "verdict": "VERIFIED_OFFSET" | "INSUFFICIENT_IMPACT" | "FAILED_EVIDENCE",
-  "audit_summary": "<concise professional audit summary>"
+  "verified_tonnes": <integer 0-{target_tonnes}>,
+  "consistency_score": <integer 0-100>,
+  "verdict": "VERIFIED_ISSUANCE" | "FRAUD_DISCREPANCY" | "INSUFFICIENT_DATA",
+  "audit_summary": "<concise audit conclusion>"
 }}"""
 
             try:
@@ -233,24 +303,28 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
                         cleaned = cleaned[:-3]
                     parsed = json.loads(cleaned.strip())
 
-                score = int(parsed.get("impact_score", 0))
+                v_tonnes = int(parsed.get("verified_tonnes", 0))
+                v_tonnes = max(0, min(target_tonnes, v_tonnes))
+                score = int(parsed.get("consistency_score", 0))
                 score = max(0, min(100, score))
-                verdict = str(parsed.get("verdict", "INSUFFICIENT_IMPACT")).strip().upper()
-                valid_v = ("VERIFIED_OFFSET", "INSUFFICIENT_IMPACT", "FAILED_EVIDENCE")
+                verdict = str(parsed.get("verdict", "INSUFFICIENT_DATA")).strip().upper()
+                valid_v = ("VERIFIED_ISSUANCE", "FRAUD_DISCREPANCY", "INSUFFICIENT_DATA")
                 if verdict not in valid_v:
-                    verdict = "VERIFIED_OFFSET" if score >= 70 else "INSUFFICIENT_IMPACT"
-                summary = str(parsed.get("audit_summary", "Audited."))[:250]
+                    verdict = "VERIFIED_ISSUANCE" if score >= 70 and v_tonnes > 0 else "INSUFFICIENT_DATA"
+                summary = str(parsed.get("audit_summary", "MRV verified."))[:250]
 
                 return {
-                    "impact_score": score,
+                    "verified_tonnes": v_tonnes,
+                    "consistency_score": score,
                     "verdict": verdict,
                     "audit_summary": summary
                 }
             except Exception as e:
                 return {
-                    "impact_score": 0,
-                    "verdict": "FAILED_EVIDENCE",
-                    "audit_summary": f"Evaluation error: {str(e)[:100]}"
+                    "verified_tonnes": 0,
+                    "consistency_score": 0,
+                    "verdict": "INSUFFICIENT_DATA",
+                    "audit_summary": f"MRV parsing error: {str(e)[:100]}"
                 }
 
         def validator_fn(leader_res) -> bool:
@@ -260,7 +334,7 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             if not isinstance(leader, dict) or "verdict" not in leader:
                 return False
 
-            valid_v = ("VERIFIED_OFFSET", "INSUFFICIENT_IMPACT", "FAILED_EVIDENCE")
+            valid_v = ("VERIFIED_ISSUANCE", "FRAUD_DISCREPANCY", "INSUFFICIENT_DATA")
             l_v = str(leader.get("verdict", "")).strip().upper()
             if l_v not in valid_v:
                 return False
@@ -268,56 +342,90 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             mine = leader_fn()
             m_v = str(mine.get("verdict", "")).strip().upper()
 
+            # Strict agreement on final verdict
             if l_v != m_v:
                 return False
 
-            if l_v != "FAILED_EVIDENCE":
-                l_score = int(leader.get("impact_score", 0))
-                m_score = int(mine.get("impact_score", 0))
-                if abs(l_score - m_score) > 20:
+            # If verified, enforce bounded variance on consistency and verified tonnage
+            if l_v == "VERIFIED_ISSUANCE":
+                l_score = int(leader.get("consistency_score", 0))
+                m_score = int(mine.get("consistency_score", 0))
+                if abs(l_score - m_score) > 15:
+                    return False
+
+                l_tonnes = int(leader.get("verified_tonnes", 0))
+                m_tonnes = int(mine.get("verified_tonnes", 0))
+                max_tonnes_variance = max(10, target_tonnes * 20 // 100)
+                if abs(l_tonnes - m_tonnes) > max_tonnes_variance:
                     return False
 
             return True
 
-        adjudication_res = gl.vm.run_nondet(leader_fn, validator_fn)
-        if isinstance(adjudication_res, dict):
-            final_res = adjudication_res
+        adjudication = gl.vm.run_nondet(leader_fn, validator_fn)
+        if isinstance(adjudication, dict):
+            final = adjudication
         else:
             try:
-                final_res = json.loads(str(adjudication_res))
+                final = json.loads(str(adjudication))
             except Exception:
-                final_res = {"impact_score": 0, "verdict": "FAILED_EVIDENCE", "audit_summary": "Consensus parse failed."}
+                final = {"verified_tonnes": 0, "consistency_score": 0, "verdict": "INSUFFICIENT_DATA", "audit_summary": "Consensus unparsed."}
 
-        score = int(final_res.get("impact_score", 0))
-        score_clamped = max(0, min(100, score))
-        verdict = str(final_res.get("verdict", "FAILED_EVIDENCE")).strip().upper()
-        summary = str(final_res.get("audit_summary", "Processed."))
+        v_tonnes = max(0, min(target_tonnes, int(final.get("verified_tonnes", 0))))
+        c_score = max(0, min(100, int(final.get("consistency_score", 0))))
+        verdict = str(final.get("verdict", "INSUFFICIENT_DATA")).strip().upper()
+        summary = str(final.get("audit_summary", "Completed."))
 
-        proj.impact_score = bigint(score_clamped)
+        proj.verified_tonnes = bigint(v_tonnes)
+        proj.consistency_score = bigint(c_score)
         proj.verdict = verdict
         proj.audit_summary = summary
-        proj.status = "VERIFIED" if verdict == "VERIFIED_OFFSET" else ("REJECTED" if verdict == "INSUFFICIENT_IMPACT" else "FAILED_EVIDENCE")
         now_ts = self._get_current_timestamp()
         proj.resolved_at = now_ts if now_ts > bigint(0) else self.project_count
 
-        if proj.status == "VERIFIED":
+        if verdict == "VERIFIED_ISSUANCE":
+            proj.status = "VERIFIED"
             self.verified_count += bigint(1)
-            self.total_offset_issued += proj.deposit_amount
-            proj.payout = proj.deposit_amount
+            self.total_tonnes_verified += proj.verified_tonnes
+
+            # Calculate total valuation based on price_per_ton
+            total_valuation = proj.verified_tonnes * self.price_per_ton
+            effective_payout = total_valuation if total_valuation <= self.buyer_pool_balance else self.buyer_pool_balance
+
+            # Split: 85% to proposer, 15% permanence buffer reserve
+            buffer_portion = (effective_payout * bigint(15)) // bigint(100)
+            net_proposer_reward = effective_payout - buffer_portion
+
+            self.buyer_pool_balance -= effective_payout
+            self.buffer_reserve_pool += buffer_portion
+
+            proj.payout_amount = net_proposer_reward
+            proj.buffer_allocated = buffer_portion
             self.projects[project_id] = proj
-            _safe_transfer(proj.proposer, proj.deposit_amount)
-        elif proj.status == "REJECTED":
-            proj.payout = bigint(0)
+
+            # Return staked bond + net carbon reward to proposer
+            total_disbursed = proj.staked_bond + net_proposer_reward
+            _safe_transfer(proj.proposer, total_disbursed)
+
+        elif verdict == "FRAUD_DISCREPANCY":
+            # Detected sensor spoofing / fraudulent claim: Slash proposer bond!
+            proj.status = "REJECTED_DISCREPANCY"
+            proj.payout_amount = bigint(0)
+            proj.buffer_allocated = bigint(0)
+            # Slashed bond is confiscated into permanence buffer pool
+            self.buffer_reserve_pool += proj.staked_bond
             self.projects[project_id] = proj
-            _safe_transfer(self.owner, proj.deposit_amount)
+
         else:
-            proj.payout = proj.deposit_amount
+            # INSUFFICIENT_DATA: Refund staked bond safely
+            proj.status = "FAILED_EVIDENCE"
+            proj.payout_amount = bigint(0)
+            proj.buffer_allocated = bigint(0)
             self.projects[project_id] = proj
-            _safe_transfer(proj.proposer, proj.deposit_amount)
+            _safe_transfer(proj.proposer, proj.staked_bond)
 
     @gl.public.write
     def cancel_project(self, project_id: str) -> None:
-        """Allow proposer to cancel pending project and recover deposit."""
+        """Allow proposer to withdraw pending project and reclaim staked bond."""
         if project_id not in self.projects:
             raise gl.UserError("Carbon project not found.")
 
@@ -330,9 +438,8 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
 
         proj.status = "CANCELLED"
         proj.verdict = "CANCELLED"
-        proj.audit_summary = "Cancelled by proposer."
-        refund = proj.deposit_amount
-        proj.payout = refund
+        proj.audit_summary = "Withdrawn by proposer before MRV."
+        refund = proj.staked_bond
         now_ts = self._get_current_timestamp()
         proj.resolved_at = now_ts if now_ts > bigint(0) else self.project_count
         self.projects[project_id] = proj
@@ -349,22 +456,29 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             "project_id": p.project_id,
             "proposer": _addr_str(p.proposer),
             "project_name": p.project_name,
-            "description": p.description,
-            "audit_report_url": p.audit_report_url,
-            "deposit_amount": str(p.deposit_amount),
+            "ecosystem_type": p.ecosystem_type,
+            "ground_sensor_url": p.ground_sensor_url,
+            "satellite_report_url": p.satellite_report_url,
+            "staked_bond": str(p.staked_bond),
+            "claimed_tonnes": int(p.claimed_tonnes),
+            "verified_tonnes": int(p.verified_tonnes),
+            "consistency_score": int(p.consistency_score),
             "status": p.status,
             "verdict": p.verdict,
-            "impact_score": int(p.impact_score),
             "audit_summary": p.audit_summary,
+            "payout_amount": str(p.payout_amount),
+            "buffer_allocated": str(p.buffer_allocated),
             "created_at": str(p.created_at),
-            "resolved_at": str(p.resolved_at),
-            "payout": str(p.payout)
+            "resolved_at": str(p.resolved_at)
         })
 
     @gl.public.view
-    def get_stats(self) -> str:
+    def get_vault_stats(self) -> str:
         return json.dumps({
             "total_projects": int(self.project_count),
             "verified_count": int(self.verified_count),
-            "total_offset_issued": str(self.total_offset_issued)
+            "total_tonnes_verified": str(self.total_tonnes_verified),
+            "buyer_pool_balance": str(self.buyer_pool_balance),
+            "buffer_reserve_pool": str(self.buffer_reserve_pool),
+            "price_per_ton": int(self.price_per_ton)
         })
